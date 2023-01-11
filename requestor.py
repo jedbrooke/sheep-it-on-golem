@@ -31,6 +31,47 @@ sys.path.append(str(examples_dir))
 
 HASH = "b26e95a58c3dfcc0bee208f081d362f67bb67255aef93938908d8699"
 
+async def worker(ctx: WorkContext, tasks):
+    # Set timeout for the first script executed on the provider. Usually, 30 seconds
+    # should be more than enough for computing a single frame of the provided scene,
+    # however a provider may require more time for the first task if it needs to download
+    # the VM image first. Once downloaded, the VM image will be cached and other tasks that use
+    # that image will be computed faster.
+    script = ctx.new_script()
+
+    async for t in tasks:
+        # apobj.notify(body="starting job", title="job is starting")
+        cmd = shlex.split(f"""/usr/local/openjdk-11/bin/java -jar /sheepit.jar \
+            --no-gpu \
+            --no-systray \
+            -cache-dir /golem/work \
+            -hostname golem \
+            -login rektsupport \
+            -password {os.getenv("KEY")} \
+            -shutdown +10 \
+            -ui text""")
+        
+        future_result = script.run(*cmd)
+       
+        yield script
+
+        t.accept_result(result=await future_result)
+    
+
+        # reinitialize the script which we send to the engine to compute subsequent frames
+        script = ctx.new_script(timeout=timedelta(minutes=1))
+
+        raw_state = await ctx.get_raw_state()
+        usage = format_usage(await ctx.get_usage())
+        cost = await ctx.get_cost()
+        print(
+            f"{TEXT_COLOR_MAGENTA}"
+            f" --- {ctx.provider_name} STATE: {raw_state}\n"
+            f" --- {ctx.provider_name} USAGE: {usage}\n"
+            f" --- {ctx.provider_name}  COST: {cost}"
+            f"{TEXT_COLOR_DEFAULT}"
+        )
+
 async def main(
     subnet_tag, min_cpu_threads, payment_driver=None, payment_network=None
 ):
@@ -45,56 +86,6 @@ async def main(
         min_cpu_threads=min_cpu_threads,
     )
 
-    async def worker(ctx: WorkContext, tasks):
-        # Set timeout for the first script executed on the provider. Usually, 30 seconds
-        # should be more than enough for computing a single frame of the provided scene,
-        # however a provider may require more time for the first task if it needs to download
-        # the VM image first. Once downloaded, the VM image will be cached and other tasks that use
-        # that image will be computed faster.
-        script = ctx.new_script(timeout=timedelta(minutes=10))
-
-        async for t in tasks:
-            # apobj.notify(body="starting job", title="job is starting")
-            cmd = shlex.split(f"""/usr/local/openjdk-11/bin/java -jar /sheepit.jar \
-                --no-gpu \
-                --no-systray \
-                -cache-dir /golem/work \
-                -hostname golem \
-                -login rektsupport \
-                -password {os.getenv("KEY")} \
-                -shutdown +10 \
-                -ui text > /golem/output/sheepit.logs 2>&1""")
-            
-            script.run(cmd)
-            
-            output_file = f"sheepit_logs/log-{t.data:04d}.log"
-            script.download_file("/golem/output/sheepit.logs", output_file)
-
-            try:
-                
-                yield script
-                # TODO: Check if job results are valid
-                # and reject by: task.reject_task(reason = 'invalid file')
-                t.accept_result(result=output_file)
-            except BatchTimeoutError:
-                print(
-                    f"Task {t} timed out on {ctx.provider_name}, time: {t.running_time}"
-                )
-                raise
-
-            # reinitialize the script which we send to the engine to compute subsequent frames
-            script = ctx.new_script(timeout=timedelta(minutes=1))
-
-            raw_state = await ctx.get_raw_state()
-            usage = format_usage(await ctx.get_usage())
-            cost = await ctx.get_cost()
-            print(
-                f"{TEXT_COLOR_MAGENTA}"
-                f" --- {ctx.provider_name} STATE: {raw_state}\n"
-                f" --- {ctx.provider_name} USAGE: {usage}\n"
-                f" --- {ctx.provider_name}  COST: {cost}"
-                f"{TEXT_COLOR_DEFAULT}"
-            )
 
     init_overhead = 3
     # Providers will not accept work if the timeout is outside of the [5 min, 30min] range.
@@ -102,7 +93,7 @@ async def main(
     # reach the providers.
     min_timeout, max_timeout = 60, 300
 
-    timeout = timedelta(minutes=300)
+    timeout = timedelta(minutes=30)
 
     async with Golem(
         budget=10.0,
@@ -117,16 +108,14 @@ async def main(
 
         completed_tasks = golem.execute_tasks(
             worker,
-            [Task(data=i) for i in range(3)],
+            [Task(data=None) for _ in range(1)],
             payload=package,
-            max_workers=3,
+            max_workers=1,
             timeout=timeout,
         )
         async for task in completed_tasks:
             num_tasks += 1
-            print(
-                f"Task computed: {task}, result: {task.result}, time: {task.running_time}"
-            )
+            print(task.result.stdout)
 
         print(
             f"{num_tasks} tasks computed, total time: {datetime.now() - start_time}"
